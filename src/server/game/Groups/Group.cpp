@@ -1,6 +1,5 @@
 /*
- * Copyright (C) 2008-2019 TrinityCore <https://www.trinitycore.org/>
- * Copyright (C) 2005-2009 MaNGOS <http://getmangos.com/>
+ * This file is part of the TrinityCore Project. See AUTHORS file for Copyright information
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the
@@ -1363,7 +1362,7 @@ void Group::CountTheRoll(Rolls::iterator rollI, Map* allowedMap)
                         ItemPosCountVec dest;
                         InventoryResult msg = player->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, roll->itemid, item->count);
                         if (msg == EQUIP_ERR_OK)
-                            player->AutoStoreLoot(disenchant->ID, LootTemplates_Disenchant, true);
+                            player->AutoStoreLoot(disenchant->ID, LootTemplates_Disenchant, ItemContext::NONE, true);
                         else // If the player's inventory is full, send the disenchant result in a mail.
                         {
                             Loot loot;
@@ -1374,7 +1373,7 @@ void Group::CountTheRoll(Rolls::iterator rollI, Map* allowedMap)
                             {
                                 LootItem* lootItem = loot.LootItemInSlot(i, player);
                                 player->SendEquipError(msg, nullptr, nullptr, lootItem->itemid);
-                                player->SendItemRetrievalMail(lootItem->itemid, lootItem->count);
+                                player->SendItemRetrievalMail(lootItem->itemid, lootItem->count, lootItem->context);
                             }
                         }
                     }
@@ -1911,9 +1910,11 @@ ItemDisenchantLootEntry const* Roll::GetItemDisenchantLoot(Player const* player)
 
         BonusData bonusData;
         bonusData.Initialize(itemInstance);
+        if (!bonusData.CanDisenchant)
+            return nullptr;
 
         ItemTemplate const* itemTemplate = sObjectMgr->GetItemTemplate(itemid);
-        uint32 itemLevel = Item::GetItemLevel(itemTemplate, bonusData, player->getLevel(), 0, 0, 0, 0, false);
+        uint32 itemLevel = Item::GetItemLevel(itemTemplate, bonusData, player->getLevel(), 0, 0, 0, 0, false, 0);
         return Item::GetDisenchantLoot(itemTemplate, bonusData.Quality, itemLevel);
     }
 

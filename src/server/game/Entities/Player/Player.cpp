@@ -1,6 +1,5 @@
 /*
- * Copyright (C) 2008-2019 TrinityCore <https://www.trinitycore.org/>
- * Copyright (C) 2005-2009 MaNGOS <http://getmangos.com/>
+ * This file is part of the TrinityCore Project. See AUTHORS file for Copyright information
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the
@@ -22,6 +21,7 @@
 #include "AchievementMgr.h"
 #include "ArenaTeam.h"
 #include "ArenaTeamMgr.h"
+#include "AzeriteEmpoweredItem.h"
 #include "AzeriteItem.h"
 #include "Bag.h"
 #include "Battlefield.h"
@@ -697,7 +697,7 @@ bool Player::StoreNewItemInBestSlots(uint32 titem_id, uint32 titem_amount)
         if (msg != EQUIP_ERR_OK)
             break;
 
-        EquipNewItem(eDest, titem_id, true);
+        EquipNewItem(eDest, titem_id, ItemContext::NONE, true);
         AutoUnequipOffhandIfNeed();
         --titem_amount;
     }
@@ -3225,7 +3225,7 @@ bool Player::IsCurrentSpecMasterySpell(SpellInfo const* spellInfo) const
     return false;
 }
 
-void Player::LearnSpell(uint32 spell_id, bool dependent, int32 fromSkill /*= 0*/)
+void Player::LearnSpell(uint32 spell_id, bool dependent, int32 fromSkill /*= 0*/, bool suppressMessaging /*= false*/)
 {
     PlayerSpellMap::iterator itr = m_spells.find(spell_id);
 
@@ -3239,6 +3239,7 @@ void Player::LearnSpell(uint32 spell_id, bool dependent, int32 fromSkill /*= 0*/
     {
         WorldPackets::Spells::LearnedSpells packet;
         packet.SpellID.push_back(spell_id);
+        packet.SuppressMessaging = suppressMessaging;
         GetSession()->SendPacket(packet.Write());
     }
 
@@ -3262,7 +3263,7 @@ void Player::LearnSpell(uint32 spell_id, bool dependent, int32 fromSkill /*= 0*/
     }
 }
 
-void Player::RemoveSpell(uint32 spell_id, bool disabled, bool learn_low_rank)
+void Player::RemoveSpell(uint32 spell_id, bool disabled /*= false*/, bool learn_low_rank /*= true*/, bool suppressMessaging /*= false*/)
 {
     PlayerSpellMap::iterator itr = m_spells.find(spell_id);
     if (itr == m_spells.end())
@@ -3430,6 +3431,7 @@ void Player::RemoveSpell(uint32 spell_id, bool disabled, bool learn_low_rank)
     {
         WorldPackets::Spells::UnlearnedSpells unlearnedSpells;
         unlearnedSpells.SpellID.push_back(spell_id);
+        unlearnedSpells.SuppressMessaging = suppressMessaging;
         SendDirectMessage(unlearnedSpells.Write());
     }
 }
@@ -3827,6 +3829,48 @@ void Player::DeleteFromDB(ObjectGuid playerguid, uint32 accountId, bool updateRe
 
             if (resultMail)
             {
+                std::unordered_map<uint32, std::vector<Item*>> itemsByMail;
+
+                stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_MAILITEMS);
+                stmt->setUInt64(0, guid);
+                PreparedQueryResult resultItems = CharacterDatabase.Query(stmt);
+
+                if (resultItems)
+                {
+                    stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_MAILITEMS_ARTIFACT);
+                    stmt->setUInt64(0, guid);
+                    PreparedQueryResult artifactResult = CharacterDatabase.Query(stmt);
+
+                    stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_MAILITEMS_AZERITE);
+                    stmt->setUInt64(0, guid);
+                    PreparedQueryResult azeriteResult = CharacterDatabase.Query(stmt);
+
+                    stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_MAILITEMS_AZERITE_MILESTONE_POWER);
+                    stmt->setUInt64(0, guid);
+                    PreparedQueryResult azeriteItemMilestonePowersResult = CharacterDatabase.Query(stmt);
+
+                    stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_MAILITEMS_AZERITE_UNLOCKED_ESSENCE);
+                    stmt->setUInt64(0, guid);
+                    PreparedQueryResult azeriteItemUnlockedEssencesResult = CharacterDatabase.Query(stmt);
+
+                    stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_MAILITEMS_AZERITE_EMPOWERED);
+                    stmt->setUInt64(0, guid);
+                    PreparedQueryResult azeriteEmpoweredItemResult = CharacterDatabase.Query(stmt);
+
+                    std::unordered_map<ObjectGuid::LowType, ItemAdditionalLoadInfo> additionalData;
+                    ItemAdditionalLoadInfo::Init(&additionalData, artifactResult, azeriteResult, azeriteItemMilestonePowersResult,
+                        azeriteItemUnlockedEssencesResult, azeriteEmpoweredItemResult);
+
+                    do
+                    {
+                        Field* fields = resultItems->Fetch();
+                        uint32 mailId = fields[44].GetUInt32();
+                        if (Item* mailItem = _LoadMailedItem(playerguid, nullptr, mailId, nullptr, fields, Trinity::Containers::MapGetValuePtr(additionalData, fields[0].GetUInt64())))
+                            itemsByMail[mailId].push_back(mailItem);
+
+                    } while (resultItems->NextRow());
+                }
+
                 do
                 {
                     Field* mailFields = resultMail->Fetch();
@@ -3862,41 +3906,14 @@ void Player::DeleteFromDB(ObjectGuid playerguid, uint32 accountId, bool updateRe
                     if (mailTemplateId)
                         draft = MailDraft(mailTemplateId, false);    // items are already included
 
-                    if (has_items)
+                    auto itemsItr = itemsByMail.find(mail_id);
+                    if (itemsItr != itemsByMail.end())
                     {
-                        // Data needs to be at first place for Item::LoadFromDB
-                        stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_MAILITEMS);
-                        stmt->setUInt32(0, mail_id);
-                        PreparedQueryResult resultItems = CharacterDatabase.Query(stmt);
-                        if (resultItems)
-                        {
-                            do
-                            {
-                                Field* itemFields = resultItems->Fetch();
-                                ObjectGuid::LowType itemGuidLow = itemFields[0].GetUInt64();
-                                uint32 itemEntry = itemFields[1].GetUInt32();
+                        for (Item* item : itemsItr->second)
+                            draft.AddItem(item);
 
-                                ItemTemplate const* itemProto = sObjectMgr->GetItemTemplate(itemEntry);
-                                if (!itemProto)
-                                {
-                                    stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_ITEM_INSTANCE);
-                                    stmt->setUInt64(0, itemGuidLow);
-                                    trans->Append(stmt);
-                                    continue;
-                                }
-
-                                Item* item = NewItemOrBag(itemProto);
-                                if (!item->LoadFromDB(itemGuidLow, playerguid, itemFields, itemEntry))
-                                {
-                                    item->FSetState(ITEM_REMOVED);
-                                    item->SaveToDB(trans);              // it also deletes item object!
-                                    continue;
-                                }
-
-                                draft.AddItem(item);
-                            }
-                            while (resultItems->NextRow());
-                        }
+                        // MailDraft will take care of freeing memory
+                        itemsByMail.erase(itemsItr);
                     }
 
                     stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_MAIL_ITEM_BY_ID);
@@ -3908,6 +3925,11 @@ void Player::DeleteFromDB(ObjectGuid playerguid, uint32 accountId, bool updateRe
                     draft.AddMoney(money).SendReturnToSender(pl_account, guid, sender, trans);
                 }
                 while (resultMail->NextRow());
+
+                // Free remaining items
+                for (auto&& kvp : itemsByMail)
+                    for (Item* item : kvp.second)
+                        delete item;
             }
 
             // Unsummon and delete for pets in world is not required: player deleted from CLI or character list with not loaded pet.
@@ -4050,6 +4072,18 @@ void Player::DeleteFromDB(ObjectGuid playerguid, uint32 accountId, bool updateRe
             trans->Append(stmt);
 
             stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_ITEM_INSTANCE_AZERITE_BY_OWNER);
+            stmt->setUInt64(0, guid);
+            trans->Append(stmt);
+
+            stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_ITEM_INSTANCE_AZERITE_MILESTONE_POWER_BY_OWNER);
+            stmt->setUInt64(0, guid);
+            trans->Append(stmt);
+
+            stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_ITEM_INSTANCE_AZERITE_UNLOCKED_ESSENCE_BY_OWNER);
+            stmt->setUInt64(0, guid);
+            trans->Append(stmt);
+
+            stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_ITEM_INSTANCE_AZERITE_EMPOWERED_BY_OWNER);
             stmt->setUInt64(0, guid);
             trans->Append(stmt);
 
@@ -6770,7 +6804,7 @@ void Player::ModifyCurrency(uint32 id, int32 count, bool printLog/* = true*/, bo
     if (id == CURRENCY_TYPE_AZERITE)
     {
         if (count > 0)
-            if (Item* heartOfAzeroth = GetItemByEntry(ITEM_ID_HEART_OF_AZEROTH))
+            if (Item* heartOfAzeroth = GetItemByEntry(ITEM_ID_HEART_OF_AZEROTH, ITEM_SEARCH_EVERYWHERE))
                 heartOfAzeroth->ToAzeriteItem()->GiveXP(uint64(count));
         return;
     }
@@ -7325,6 +7359,7 @@ void Player::_ApplyItemMods(Item* item, uint8 slot, bool apply, bool updateItemA
     if (updateItemAuras)
         ApplyItemDependentAuras(item, apply);
     ApplyArtifactPowers(item, apply);
+    ApplyAzeritePowers(item, apply);
     ApplyEnchantment(item, apply);
 
     TC_LOG_DEBUG("entities.player.items", "Player::_ApplyItemMods: completed");
@@ -7339,31 +7374,7 @@ void Player::_ApplyItemBonuses(Item* item, uint8 slot, bool apply)
     uint32 itemLevel = item->GetItemLevel(this);
     float combatRatingMultiplier = 1.0f;
     if (GtCombatRatingsMultByILvl const* ratingMult = sCombatRatingsMultByILvlGameTable.GetRow(itemLevel))
-    {
-        switch (proto->GetInventoryType())
-        {
-            case INVTYPE_WEAPON:
-            case INVTYPE_SHIELD:
-            case INVTYPE_RANGED:
-            case INVTYPE_2HWEAPON:
-            case INVTYPE_WEAPONMAINHAND:
-            case INVTYPE_WEAPONOFFHAND:
-            case INVTYPE_HOLDABLE:
-            case INVTYPE_RANGEDRIGHT:
-                combatRatingMultiplier = ratingMult->WeaponMultiplier;
-                break;
-            case INVTYPE_TRINKET:
-                combatRatingMultiplier = ratingMult->TrinketMultiplier;
-                break;
-            case INVTYPE_NECK:
-            case INVTYPE_FINGER:
-                combatRatingMultiplier = ratingMult->JewelryMultiplier;
-                break;
-            default:
-                combatRatingMultiplier = ratingMult->ArmorMultiplier;
-                break;
-        }
-    }
+        combatRatingMultiplier = GetIlvlStatMultiplier(ratingMult, proto->GetInventoryType());
 
     // req. check at equip, but allow use for extended range if range limit max level, set proper level
     for (uint8 i = 0; i < MAX_ITEM_PROTO_STATS; ++i)
@@ -7401,9 +7412,13 @@ void Player::_ApplyItemBonuses(Item* item, uint8 slot, bool apply)
             //     ApplyStatBuffMod(STAT_SPIRIT, CalculatePct(val, GetModifierValue(UNIT_MOD_STAT_SPIRIT, BASE_PCT_EXCLUDE_CREATE)), apply);
             //     break;
             case ITEM_MOD_STAMINA:                          //modify stamina
+            {
+                if (GtStaminaMultByILvl const* staminaMult = sStaminaMultByILvlGameTable.GetRow(itemLevel))
+                    val = int32(val * GetIlvlStatMultiplier(staminaMult, proto->GetInventoryType()));
                 HandleStatModifier(UNIT_MOD_STAT_STAMINA, BASE_VALUE, float(val), apply);
                 ApplyStatBuffMod(STAT_STAMINA, CalculatePct(val, GetModifierValue(UNIT_MOD_STAT_STAMINA, BASE_PCT_EXCLUDE_CREATE)), apply);
                 break;
+            }
             case ITEM_MOD_DEFENSE_SKILL_RATING:
                 ApplyRatingMod(CR_DEFENSE_SKILL, int32(val * combatRatingMultiplier), apply);
                 break;
@@ -7831,6 +7846,9 @@ void Player::UpdateItemSetAuras(bool formChange /*= false*/)
 
 void Player::ApplyArtifactPowers(Item* item, bool apply)
 {
+    if (item->IsArtifactDisabled())
+        return;
+
     for (UF::ArtifactPower const& artifactPower : item->m_itemData->ArtifactPowers)
     {
         uint8 rank = artifactPower.CurrentRankWithBonus;
@@ -7908,6 +7926,106 @@ void Player::ApplyArtifactPowerRank(Item* artifact, ArtifactPowerRankEntry const
         }
     }
 
+}
+
+void Player::ApplyAzeritePowers(Item* item, bool apply)
+{
+    if (AzeriteItem* azeriteItem = item->ToAzeriteItem())
+    {
+        // milestone powers
+        for (uint32 azeriteItemMilestonePowerId : azeriteItem->m_azeriteItemData->UnlockedEssenceMilestones)
+            ApplyAzeriteItemMilestonePower(azeriteItem, sAzeriteItemMilestonePowerStore.AssertEntry(azeriteItemMilestonePowerId), apply);
+
+        // essences
+        if (UF::SelectedAzeriteEssences const* selectedEssences = azeriteItem->GetSelectedAzeriteEssences())
+            for (uint8 slot = 0; slot < MAX_AZERITE_ESSENCE_SLOT; ++slot)
+                if (selectedEssences->AzeriteEssenceID[slot])
+                    ApplyAzeriteEssence(azeriteItem, selectedEssences->AzeriteEssenceID[slot], azeriteItem->GetEssenceRank(selectedEssences->AzeriteEssenceID[slot]),
+                        AzeriteItemMilestoneType(sDB2Manager.GetAzeriteItemMilestonePower(slot)->Type) == AzeriteItemMilestoneType::MajorEssence, apply);
+    }
+    else if (AzeriteEmpoweredItem* azeriteEmpoweredItem = item->ToAzeriteEmpoweredItem())
+    {
+        if (!apply || GetItemByEntry(ITEM_ID_HEART_OF_AZEROTH, ITEM_SEARCH_IN_EQUIPMENT))
+            for (int32 i = 0; i < MAX_AZERITE_EMPOWERED_TIER; ++i)
+                if (AzeritePowerEntry const* azeritePower = sAzeritePowerStore.LookupEntry(azeriteEmpoweredItem->GetSelectedAzeritePower(i)))
+                    ApplyAzeritePower(azeriteEmpoweredItem, azeritePower, apply);
+    }
+}
+
+void Player::ApplyAzeriteItemMilestonePower(AzeriteItem* item, AzeriteItemMilestonePowerEntry const* azeriteItemMilestonePower, bool apply)
+{
+    AzeriteItemMilestoneType type = AzeriteItemMilestoneType(azeriteItemMilestonePower->Type);
+    if (type == AzeriteItemMilestoneType::BonusStamina)
+    {
+        if (AzeritePowerEntry const* azeritePower = sAzeritePowerStore.LookupEntry(azeriteItemMilestonePower->AzeritePowerID))
+        {
+            if (apply)
+                CastSpell(this, azeritePower->SpellID, true, item);
+            else
+                RemoveAurasDueToItemSpell(azeritePower->SpellID, item->GetGUID());
+        }
+    }
+}
+
+void Player::ApplyAzeriteEssence(AzeriteItem* item, uint32 azeriteEssenceId, uint32 rank, bool major, bool apply)
+{
+    for (uint32 currentRank = 1; currentRank <= rank; ++currentRank)
+    {
+        if (AzeriteEssencePowerEntry const* azeriteEssencePower = sDB2Manager.GetAzeriteEssencePower(azeriteEssenceId, currentRank))
+        {
+            ApplyAzeriteEssencePower(item, azeriteEssencePower, major, apply);
+            if (major && currentRank == 1)
+            {
+                if (apply)
+                    CastCustomSpell(SPELL_ID_HEART_ESSENCE_ACTION_BAR_OVERRIDE, SPELLVALUE_BASE_POINT0, azeriteEssencePower->MajorPowerDescription, this, TRIGGERED_FULL_MASK);
+                else
+                    RemoveAurasDueToSpell(SPELL_ID_HEART_ESSENCE_ACTION_BAR_OVERRIDE);
+            }
+        }
+    }
+}
+
+void Player::ApplyAzeriteEssencePower(AzeriteItem* item, AzeriteEssencePowerEntry const* azeriteEssencePower, bool major, bool apply)
+{
+    if (SpellInfo const* powerSpell = sSpellMgr->GetSpellInfo(azeriteEssencePower->MinorPowerDescription))
+    {
+        if (apply)
+            CastSpell(this, powerSpell, true, item);
+        else
+            RemoveAurasDueToItemSpell(powerSpell->Id, item->GetGUID());
+    }
+
+    if (major)
+    {
+        if (SpellInfo const* powerSpell = sSpellMgr->GetSpellInfo(azeriteEssencePower->MajorPowerDescription))
+        {
+            if (powerSpell->IsPassive())
+            {
+                if (apply)
+                    CastSpell(this, powerSpell, true, item);
+                else
+                    RemoveAurasDueToItemSpell(powerSpell->Id, item->GetGUID());
+            }
+            else
+            {
+                if (apply)
+                    LearnSpell(powerSpell->Id, true, 0, true);
+                else
+                    RemoveSpell(powerSpell->Id, false, false, true);
+            }
+        }
+    }
+}
+
+void Player::ApplyAzeritePower(AzeriteEmpoweredItem* item, AzeritePowerEntry const* azeritePower, bool apply)
+{
+    if (apply)
+    {
+        if (!azeritePower->SpecSetID || sDB2Manager.IsSpecSetMember(azeritePower->SpecSetID, GetPrimarySpecialization()))
+            CastSpell(this, azeritePower->SpellID, true, item);
+    }
+    else
+        RemoveAurasDueToItemSpell(azeritePower->SpellID, item->GetGUID());
 }
 
 void Player::CastItemCombatSpell(DamageInfo const& damageInfo)
@@ -8288,6 +8406,34 @@ void Player::_ApplyAllLevelScaleItemMods(bool apply)
     }
 }
 
+void Player::ApplyAllAzeriteItemMods(bool apply)
+{
+    for (uint8 i = 0; i < INVENTORY_SLOT_BAG_END; ++i)
+    {
+        if (m_items[i])
+        {
+            if (!m_items[i]->IsAzeriteItem() || m_items[i]->IsBroken() || !CanUseAttackType(Player::GetAttackBySlot(i, m_items[i]->GetTemplate()->GetInventoryType())))
+                continue;
+
+            ApplyAzeritePowers(m_items[i], apply);
+        }
+    }
+}
+
+void Player::ApplyAllAzeriteEmpoweredItemMods(bool apply)
+{
+    for (uint8 i = 0; i < INVENTORY_SLOT_BAG_END; ++i)
+    {
+        if (m_items[i])
+        {
+            if (!m_items[i]->IsAzeriteEmpoweredItem() || m_items[i]->IsBroken() || !CanUseAttackType(Player::GetAttackBySlot(i, m_items[i]->GetTemplate()->GetInventoryType())))
+                continue;
+
+            ApplyAzeritePowers(m_items[i], apply);
+        }
+    }
+}
+
 ObjectGuid Player::GetLootWorldObjectGUID(ObjectGuid const& lootObjectGuid) const
 {
     auto itr = m_AELootView.find(lootObjectGuid);
@@ -8408,7 +8554,7 @@ void Player::SendLoot(ObjectGuid guid, LootType loot_type, bool aeLooting/* = fa
                 if (groupRules)
                     group->UpdateLooterGuid(go, true);
 
-                loot->FillLoot(lootid, LootTemplates_Gameobject, this, !groupRules, false, go->GetLootMode());
+                loot->FillLoot(lootid, LootTemplates_Gameobject, this, !groupRules, false, go->GetLootMode(), GetMap()->GetDifficultyLootItemContext());
                 go->SetLootGenerationTime();
 
                 // get next RR player (for next loot)
@@ -11172,7 +11318,7 @@ InventoryResult Player::CanStoreItems(Item** items, int count, uint32* offending
 InventoryResult Player::CanEquipNewItem(uint8 slot, uint16 &dest, uint32 item, bool swap) const
 {
     dest = 0;
-    Item* pItem = Item::CreateItem(item, 1, this);
+    Item* pItem = Item::CreateItem(item, 1, ItemContext::NONE, this);
     if (pItem)
     {
         InventoryResult result = CanEquipItem(slot, dest, pItem, swap);
@@ -11802,13 +11948,13 @@ InventoryResult Player::CanRollForItemInLFG(ItemTemplate const* proto, WorldObje
 
 // Return stored item (if stored to stack, it can diff. from pItem). And pItem ca be deleted in this case.
 Item* Player::StoreNewItem(ItemPosCountVec const& pos, uint32 itemId, bool update, ItemRandomBonusListId randomBonusListId /*= 0*/,
-    GuidSet const& allowedLooters /*= GuidSet()*/, uint8 context /*= 0*/, std::vector<int32> const& bonusListIDs /*= std::vector<int32>()*/, bool addToCollection /*= true*/)
+    GuidSet const& allowedLooters /*= GuidSet()*/, ItemContext context /*= ItemContext::NONE*/, std::vector<int32> const& bonusListIDs /*= std::vector<int32>()*/, bool addToCollection /*= true*/)
 {
     uint32 count = 0;
     for (ItemPosCountVec::const_iterator itr = pos.begin(); itr != pos.end(); ++itr)
         count += itr->count;
 
-    Item* item = Item::CreateItem(itemId, count, this);
+    Item* item = Item::CreateItem(itemId, count, context, this);
     if (item)
     {
         ItemAddedQuestCheck(itemId, count);
@@ -11817,7 +11963,6 @@ Item* Player::StoreNewItem(ItemPosCountVec const& pos, uint32 itemId, bool updat
 
         item->AddItemFlag(ITEM_FIELD_FLAG_NEW_ITEM);
 
-        item->SetContext(context);
         item->SetBonuses(bonusListIDs);
 
         item = StoreItem(pos, item, update);
@@ -11995,9 +12140,9 @@ Item* Player::_StoreItem(uint16 pos, Item* pItem, uint32 count, bool clone, bool
     }
 }
 
-Item* Player::EquipNewItem(uint16 pos, uint32 item, bool update)
+Item* Player::EquipNewItem(uint16 pos, uint32 item, ItemContext context, bool update)
 {
-    if (Item* pItem = Item::CreateItem(item, 1, this))
+    if (Item* pItem = Item::CreateItem(item, 1, context, this))
     {
         ItemAddedQuestCheck(item, 1);
         UpdateCriteria(CRITERIA_TYPE_RECEIVE_EPIC_ITEM, item, 1);
@@ -12053,6 +12198,8 @@ Item* Player::EquipItem(uint16 pos, Item* pItem, bool update)
                 }
             }
         }
+
+        pItem->AddItemFlag2(ITEM_FIELD_FLAG2_EQUIPPED);
 
         if (IsInWorld() && update)
         {
@@ -12227,6 +12374,8 @@ void Player::QuickEquipItem(uint16 pos, Item* pItem)
         uint8 slot = pos & 255;
         VisualizeItem(slot, pItem);
 
+        pItem->AddItemFlag2(ITEM_FIELD_FLAG2_EQUIPPED);
+
         if (IsInWorld())
         {
             pItem->AddToWorld();
@@ -12320,6 +12469,8 @@ void Player::RemoveItem(uint8 bag, uint8 slot, bool update)
                     RemoveItemsSetItem(this, pProto);
 
                 _ApplyItemMods(pItem, slot, false, update);
+
+                pItem->RemoveItemFlag2(ITEM_FIELD_FLAG2_EQUIPPED);
 
                 // remove item dependent auras and casts (only weapon and armor slots)
                 if (slot < EQUIPMENT_SLOT_END)
@@ -12811,31 +12962,61 @@ void Player::DestroyConjuredItems(bool update)
                 DestroyItem(INVENTORY_SLOT_BAG_0, i, update);
 }
 
-Item* Player::GetItemByEntry(uint32 entry) const
+Item* Player::GetItemByEntry(uint32 entry, ItemSearchLocation where /*= ITEM_SEARCH_DEFAULT*/) const
 {
-    // in inventory
-    uint8 inventoryEnd = INVENTORY_SLOT_ITEM_START + GetInventorySlotCount();
-    for (uint8 i = INVENTORY_SLOT_ITEM_START; i < inventoryEnd; ++i)
-        if (Item* pItem = GetItemByPos(INVENTORY_SLOT_BAG_0, i))
-            if (pItem->GetEntry() == entry)
-                return pItem;
+    if (where & ITEM_SEARCH_IN_EQUIPMENT)
+    {
+        for (uint8 i = EQUIPMENT_SLOT_START; i < INVENTORY_SLOT_BAG_END; ++i)
+            if (Item* pItem = GetItemByPos(INVENTORY_SLOT_BAG_0, i))
+                if (pItem->GetEntry() == entry)
+                    return pItem;
 
-    for (uint8 i = INVENTORY_SLOT_BAG_START; i < INVENTORY_SLOT_BAG_END; ++i)
-        if (Bag* pBag = GetBagByPos(i))
-            for (uint32 j = 0; j < pBag->GetBagSize(); ++j)
-                if (Item* pItem = pBag->GetItemByPos(j))
-                    if (pItem->GetEntry() == entry)
-                        return pItem;
+    }
 
-    for (uint8 i = EQUIPMENT_SLOT_START; i < INVENTORY_SLOT_BAG_END; ++i)
-        if (Item* pItem = GetItemByPos(INVENTORY_SLOT_BAG_0, i))
-            if (pItem->GetEntry() == entry)
-                return pItem;
+    if (where & ITEM_SEARCH_IN_INVENTORY)
+    {
+        // in inventory
+        uint8 inventoryEnd = INVENTORY_SLOT_ITEM_START + GetInventorySlotCount();
+        for (uint8 i = INVENTORY_SLOT_ITEM_START; i < inventoryEnd; ++i)
+            if (Item* pItem = GetItemByPos(INVENTORY_SLOT_BAG_0, i))
+                if (pItem->GetEntry() == entry)
+                    return pItem;
 
-    for (uint8 i = CHILD_EQUIPMENT_SLOT_START; i < CHILD_EQUIPMENT_SLOT_END; ++i)
-        if (Item* pItem = GetItemByPos(INVENTORY_SLOT_BAG_0, i))
-            if (pItem->GetEntry() == entry)
-                return pItem;
+        for (uint8 i = INVENTORY_SLOT_BAG_START; i < INVENTORY_SLOT_BAG_END; ++i)
+            if (Bag* pBag = GetBagByPos(i))
+                for (uint32 j = 0; j < pBag->GetBagSize(); ++j)
+                    if (Item* pItem = pBag->GetItemByPos(j))
+                        if (pItem->GetEntry() == entry)
+                            return pItem;
+
+        for (uint8 i = CHILD_EQUIPMENT_SLOT_START; i < CHILD_EQUIPMENT_SLOT_END; ++i)
+            if (Item* pItem = GetItemByPos(INVENTORY_SLOT_BAG_0, i))
+                if (pItem->GetEntry() == entry)
+                    return pItem;
+    }
+
+    if (where & ITEM_SEARCH_IN_BANK)
+    {
+        for (uint8 i = BANK_SLOT_ITEM_START; i < BANK_SLOT_ITEM_END; ++i)
+            if (Item* pItem = GetItemByPos(INVENTORY_SLOT_BAG_0, i))
+                if (pItem->GetEntry() == entry)
+                    return pItem;
+
+        for (uint8 i = BANK_SLOT_BAG_START; i < BANK_SLOT_BAG_END; ++i)
+            if (Bag* pBag = GetBagByPos(i))
+                for (uint32 j = 0; j < pBag->GetBagSize(); ++j)
+                    if (Item* pItem = pBag->GetItemByPos(j))
+                        if (pItem->GetEntry() == entry)
+                            return pItem;
+    }
+
+    if (where & ITEM_SEARCH_IN_REAGENT_BANK)
+    {
+        for (uint8 i = REAGENT_SLOT_START; i < REAGENT_SLOT_END; ++i)
+            if (Item* pItem = GetItemByPos(INVENTORY_SLOT_BAG_0, i))
+                if (pItem->GetEntry() == entry)
+                    return pItem;
+    }
 
     return nullptr;
 }
@@ -15435,7 +15616,7 @@ void Player::RewardQuest(Quest const* quest, uint32 reward, Object* questGiver, 
                     SendNewItem(item, quest->RewardItemCount[i], true, false);
                 }
                 else if (quest->IsDFQuest())
-                    SendItemRetrievalMail(quest->RewardItemId[i], quest->RewardItemCount[i]);
+                    SendItemRetrievalMail(quest->RewardItemId[i], quest->RewardItemCount[i], ItemContext::Quest_Reward);
             }
         }
     }
@@ -17610,8 +17791,8 @@ bool Player::LoadFromDB(ObjectGuid guid, CharacterDatabaseQueryHolder* holder)
     //"totalKills, todayKills, yesterdayKills, chosenTitle, watchedFaction, drunk, "
     // 56      57      58      59      60      61      62      63           64                 65          66             67           68          69              70                    71
     //"health, power1, power2, power3, power4, power5, power6, instance_id, activeTalentGroup, lootSpecId, exploredZones, knownTitles, actionBars, raidDifficulty, legacyRaidDifficulty, fishing_steps "
-    // 72     73          74             75                76
-    //"honor, honorLevel, prestigeLevel, honor_rest_state, honor_rest_bonus "
+    // 72     73          74                75                76
+    //"honor, honorLevel, honor_rest_state, honor_rest_bonus, numRespecs "
     //
     //"FROM characters WHERE guid = ?", CONNECTION_ASYNC);
     PreparedQueryResult result = holder->GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_FROM);
@@ -18136,6 +18317,7 @@ bool Player::LoadFromDB(ObjectGuid guid, CharacterDatabaseQueryHolder* holder)
     _LoadSkills(holder->GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_SKILLS));
     UpdateSkillsForLevel(); //update skills after load, to make sure they are correctly update at player load
 
+    SetNumRespecs(fields[76].GetUInt8());
     SetPrimarySpecialization(fields[36].GetUInt32());
     SetActiveTalentGroup(fields[64].GetUInt8());
     ChrSpecializationEntry const* primarySpec = sChrSpecializationStore.LookupEntry(GetPrimarySpecialization());
@@ -18185,7 +18367,13 @@ bool Player::LoadFromDB(ObjectGuid guid, CharacterDatabaseQueryHolder* holder)
     // must be before inventory (some items required reputation check)
     m_reputationMgr->LoadFromDB(holder->GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_REPUTATION));
 
-    _LoadInventory(holder->GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_INVENTORY), holder->GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_ARTIFACTS), time_diff);
+    _LoadInventory(holder->GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_INVENTORY),
+        holder->GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_ARTIFACTS),
+        holder->GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_AZERITE),
+        holder->GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_AZERITE_MILESTONE_POWERS),
+        holder->GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_AZERITE_UNLOCKED_ESSENCES),
+        holder->GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_AZERITE_EMPOWERED),
+        time_diff);
 
     if (IsVoidStorageUnlocked())
         _LoadVoidStorage(holder->GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_VOID_STORAGE));
@@ -18487,8 +18675,8 @@ void Player::_LoadAuras(PreparedQueryResult auraResult, PreparedQueryResult effe
     }
 
     /*
-                    0         1      2           3                4           5            6           7              8              9
-    SELECT casterGuid, itemGuid, spell, effectMask, recalculateMask, stackCount, maxDuration, remainTime, remainCharges, castItemLevel FROM character_aura WHERE guid = ?
+                    0         1      2           3                4           5            6           7              8           9             10
+    SELECT casterGuid, itemGuid, spell, effectMask, recalculateMask, stackCount, maxDuration, remainTime, remainCharges, castItemId, castItemLevel FROM character_aura WHERE guid = ?
     */
     if (auraResult)
     {
@@ -18503,7 +18691,8 @@ void Player::_LoadAuras(PreparedQueryResult auraResult, PreparedQueryResult effe
             int32 maxDuration = fields[6].GetInt32();
             int32 remainTime = fields[7].GetInt32();
             uint8 remainCharges = fields[8].GetUInt8();
-            int32 castItemLevel = fields[9].GetInt32();
+            uint32 castItemId = fields[9].GetUInt32();
+            int32 castItemLevel = fields[10].GetInt32();
 
             SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(key.SpellId);
             if (!spellInfo)
@@ -18535,7 +18724,7 @@ void Player::_LoadAuras(PreparedQueryResult auraResult, PreparedQueryResult effe
 
             AuraLoadEffectInfo& info = effectInfo[key];
             ObjectGuid castId = ObjectGuid::Create<HighGuid::Cast>(SPELL_CAST_SOURCE_NORMAL, GetMapId(), spellInfo->Id, GetMap()->GenerateLowGuid<HighGuid::Cast>());
-            if (Aura* aura = Aura::TryCreate(spellInfo, castId, key.EffectMask, this, nullptr, info.BaseAmounts.data(), nullptr, casterGuid, itemGuid, castItemLevel))
+            if (Aura* aura = Aura::TryCreate(spellInfo, castId, key.EffectMask, this, nullptr, info.BaseAmounts.data(), nullptr, casterGuid, itemGuid, castItemId, castItemLevel))
             {
                 if (!aura->CanBeSaved())
                 {
@@ -18582,7 +18771,9 @@ void Player::LoadCorpse(PreparedQueryResult result)
     RemoveAtLoginFlag(AT_LOGIN_RESURRECT);
 }
 
-void Player::_LoadInventory(PreparedQueryResult result, PreparedQueryResult artifactsResult, uint32 timeDiff)
+void Player::_LoadInventory(PreparedQueryResult result, PreparedQueryResult artifactsResult, PreparedQueryResult azeriteResult,
+    PreparedQueryResult azeriteItemMilestonePowersResult, PreparedQueryResult azeriteItemUnlockedEssencesResult,
+    PreparedQueryResult azeriteEmpoweredItemResult, uint32 timeDiff)
 {
     //           0          1            2                3      4         5        6      7             8                 9          10          11    12
     // SELECT guid, itemEntry, creatorGuid, giftCreatorGuid, count, duration, charges, flags, enchantments, randomPropertyId, durability, playedTime, text,
@@ -18594,9 +18785,9 @@ void Player::_LoadInventory(PreparedQueryResult result, PreparedQueryResult arti
     //        spellItemEnchantmentAllSpecs, spellItemEnchantmentSpec1, spellItemEnchantmentSpec2, spellItemEnchantmentSpec3, spellItemEnchantmentSpec4,
     //                29           30           31                32          33           34           35                36          37           38           39                40
     //        gemItemId1, gemBonuses1, gemContext1, gemScalingLevel1, gemItemId2, gemBonuses2, gemContext2, gemScalingLevel2, gemItemId3, gemBonuses3, gemContext3, gemScalingLevel3
-    //                       41                      42     43        44                 45
-    //        fixedScalingLevel, artifactKnowledgeLevel, iz.xp, iz.level, iz.knowledgeLevel FROM item_instance
-    //         46    47
+    //                       41                      42
+    //        fixedScalingLevel, artifactKnowledgeLevel FROM item_instance
+    //         43    44
     //        bag, slot
     // FROM character_inventory ci
     // JOIN item_instance ii ON ci.item = ii.guid
@@ -18612,38 +18803,9 @@ void Player::_LoadInventory(PreparedQueryResult result, PreparedQueryResult arti
     //NOTE2: the "order by `slot`" is needed because mainhand weapons are (wrongly?)
     //expected to be equipped before offhand items (@todo fixme)
 
-    //                 0     1                       2                 3                   4                 5
-    // SELECT a.itemGuid, a.xp, a.artifactAppearanceId, a.artifactTierId, ap.artifactPowerId, ap.purchasedRank FROM item_instance_artifact_powers ap LEFT JOIN item_instance_artifact a ON ap.itemGuid = a.itemGuid INNER JOIN character_inventory ci ON ci.item = ap.guid WHERE ci.guid = ?
-    std::unordered_map<ObjectGuid, std::tuple<uint64, uint32, uint32, std::vector<ArtifactPowerLoadInfo>>> artifactData;
-    if (artifactsResult)
-    {
-        do
-        {
-            Field* fields = artifactsResult->Fetch();
-            auto& artifactDataEntry = artifactData[ObjectGuid::Create<HighGuid::Item>(fields[0].GetUInt64())];
-            std::get<0>(artifactDataEntry) = fields[1].GetUInt64();
-            std::get<1>(artifactDataEntry) = fields[2].GetUInt32();
-            std::get<2>(artifactDataEntry) = fields[3].GetUInt32();
-            ArtifactPowerLoadInfo artifactPowerData;
-            artifactPowerData.ArtifactPowerId = fields[4].GetUInt32();
-            artifactPowerData.PurchasedRank = fields[5].GetUInt8();
-            if (ArtifactPowerEntry const* artifactPower = sArtifactPowerStore.LookupEntry(artifactPowerData.ArtifactPowerId))
-            {
-                uint32 maxRank = artifactPower->MaxPurchasableRank;
-                // allow ARTIFACT_POWER_FLAG_FINAL to overflow maxrank here - needs to be handled in Item::CheckArtifactUnlock (will refund artifact power)
-                if (artifactPower->Flags & ARTIFACT_POWER_FLAG_MAX_RANK_WITH_TIER && artifactPower->Tier < std::get<2>(artifactDataEntry))
-                    maxRank += std::get<2>(artifactDataEntry) - artifactPower->Tier;
-
-                if (artifactPowerData.PurchasedRank > maxRank)
-                    artifactPowerData.PurchasedRank = maxRank;
-
-                artifactPowerData.CurrentRankWithBonus = (artifactPower->Flags & ARTIFACT_POWER_FLAG_FIRST) == ARTIFACT_POWER_FLAG_FIRST ? 1 : 0;
-
-                std::get<3>(artifactDataEntry).push_back(artifactPowerData);
-            }
-
-        } while (artifactsResult->NextRow());
-    }
+    std::unordered_map<ObjectGuid::LowType, ItemAdditionalLoadInfo> additionalData;
+    ItemAdditionalLoadInfo::Init(&additionalData, artifactsResult, azeriteResult, azeriteItemMilestonePowersResult,
+        azeriteItemUnlockedEssencesResult, azeriteEmpoweredItemResult);
 
     if (result)
     {
@@ -18661,12 +18823,23 @@ void Player::_LoadInventory(PreparedQueryResult result, PreparedQueryResult arti
             Field* fields = result->Fetch();
             if (Item* item = _LoadItem(trans, zoneId, timeDiff, fields))
             {
-                auto artifactDataItr = artifactData.find(item->GetGUID());
-                if (item->GetTemplate()->GetArtifactID() && artifactDataItr != artifactData.end())
-                    item->LoadArtifactData(this, std::get<0>(artifactDataItr->second), std::get<1>(artifactDataItr->second), std::get<2>(artifactDataItr->second), std::get<3>(artifactDataItr->second));
+                if (ItemAdditionalLoadInfo* addionalDataPtr = Trinity::Containers::MapGetValuePtr(additionalData, fields[0].GetUInt64()))
+                {
+                    if (item->GetTemplate()->GetArtifactID() && addionalDataPtr->Artifact)
+                        item->LoadArtifactData(this, addionalDataPtr->Artifact->Xp, addionalDataPtr->Artifact->ArtifactAppearanceId,
+                            addionalDataPtr->Artifact->ArtifactTierId, addionalDataPtr->Artifact->ArtifactPowers);
 
-                ObjectGuid bagGuid = fields[46].GetUInt64() ? ObjectGuid::Create<HighGuid::Item>(fields[46].GetUInt64()) : ObjectGuid::Empty;
-                uint8 slot = fields[47].GetUInt8();
+                    if (addionalDataPtr->AzeriteItem)
+                        if (AzeriteItem* azeriteItem = item->ToAzeriteItem())
+                            azeriteItem->LoadAzeriteItemData(this, *addionalDataPtr->AzeriteItem);
+
+                    if (addionalDataPtr->AzeriteEmpoweredItem)
+                        if (AzeriteEmpoweredItem* azeriteEmpoweredItem = item->ToAzeriteEmpoweredItem())
+                            azeriteEmpoweredItem->LoadAzeriteEmpoweredItemData(this, *addionalDataPtr->AzeriteEmpoweredItem);
+                }
+
+                ObjectGuid bagGuid = fields[43].GetUInt64() ? ObjectGuid::Create<HighGuid::Item>(fields[43].GetUInt64()) : ObjectGuid::Empty;
+                uint8 slot = fields[44].GetUInt8();
 
                 GetSession()->GetCollectionMgr()->CheckHeirloomUpgrades(item);
                 GetSession()->GetCollectionMgr()->AddItemAppearance(item);
@@ -18784,6 +18957,8 @@ void Player::_LoadInventory(PreparedQueryResult result, PreparedQueryResult arti
     }
     //if (IsAlive())
     _ApplyAllItemMods();
+    // Apply all azerite item mods, azerite empowered item mods will get applied through its spell script
+    ApplyAllAzeriteItemMods(true);
 }
 
 void Player::_LoadVoidStorage(PreparedQueryResult result)
@@ -18803,7 +18978,7 @@ void Player::_LoadVoidStorage(PreparedQueryResult result)
         ItemRandomBonusListId randomBonusListId = fields[4].GetUInt32();
         uint32 fixedScalingLevel = fields[5].GetUInt32();
         uint32 artifactKnowledgeLevel = fields[6].GetUInt32();
-        uint8 context = fields[7].GetUInt8();
+        ItemContext context = ItemContext(fields[7].GetUInt8());
         std::vector<int32> bonusListIDs;
         Tokenizer bonusListIdTokens(fields[8].GetString(), ' ');
         for (char const* token : bonusListIdTokens)
@@ -18966,66 +19141,78 @@ Item* Player::_LoadItem(CharacterDatabaseTransaction& trans, uint32 zoneId, uint
             GetGUID().ToString().c_str(), GetName().c_str(), itemEntry);
         Item::DeleteFromInventoryDB(trans, itemGuid);
         Item::DeleteFromDB(trans, itemGuid);
+        AzeriteItem::DeleteFromDB(trans, itemGuid);
+        AzeriteEmpoweredItem::DeleteFromDB(trans, itemGuid);
     }
     return item;
 }
 
 // load mailed item which should receive current player
-void Player::_LoadMailedItems(Mail* mail)
+Item* Player::_LoadMailedItem(ObjectGuid const& playerGuid, Player* player, uint32 mailId, Mail* mail, Field* fields, ItemAdditionalLoadInfo* addionalData)
 {
-    // data needs to be at first place for Item::LoadFromDB
-    CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_MAILITEMS);
-    stmt->setUInt32(0, mail->messageID);
-    PreparedQueryResult result = CharacterDatabase.Query(stmt);
-    if (!result)
-        return;
+    ObjectGuid::LowType itemGuid = fields[0].GetUInt64();
+    uint32 itemEntry = fields[1].GetUInt32();
 
-    do
+    ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemEntry);
+    if (!proto)
     {
-        Field* fields = result->Fetch();
+        TC_LOG_ERROR("entities.player", "Player '%s' (%s) has unknown item_template in mailed items (GUID: " UI64FMTD ", Entry: %u) in mail (%u), deleted.",
+            player ? player->GetName().c_str() : "<unknown>", playerGuid.ToString().c_str(), itemGuid, itemEntry, mailId);
 
-        ObjectGuid::LowType itemGuid = fields[0].GetUInt64();
-        uint32 itemEntry = fields[1].GetUInt32();
+        CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
 
+        CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_INVALID_MAIL_ITEM);
+        stmt->setUInt64(0, itemGuid);
+        trans->Append(stmt);
+
+        Item::DeleteFromDB(trans, itemGuid);
+        AzeriteItem::DeleteFromDB(trans, itemGuid);
+        AzeriteEmpoweredItem::DeleteFromDB(trans, itemGuid);
+
+        CharacterDatabase.CommitTransaction(trans);
+        return nullptr;
+    }
+
+    Item* item = NewItemOrBag(proto);
+
+    ObjectGuid ownerGuid = fields[43].GetUInt64() ? ObjectGuid::Create<HighGuid::Player>(fields[43].GetUInt64()) : ObjectGuid::Empty;
+    if (!item->LoadFromDB(itemGuid, ownerGuid, fields, itemEntry))
+    {
+        TC_LOG_ERROR("entities.player", "Player::_LoadMailedItems: Item (GUID: " UI64FMTD ") in mail (%u) doesn't exist, deleted from mail.", itemGuid, mailId);
+
+        CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_MAIL_ITEM);
+        stmt->setUInt64(0, itemGuid);
+        CharacterDatabase.Execute(stmt);
+
+        item->FSetState(ITEM_REMOVED);
+
+        CharacterDatabaseTransaction temp = CharacterDatabaseTransaction(nullptr);
+        item->SaveToDB(temp);                               // it also deletes item object !
+        return nullptr;
+    }
+
+    if (addionalData)
+    {
+        if (item->GetTemplate()->GetArtifactID() && addionalData->Artifact)
+            item->LoadArtifactData(player, addionalData->Artifact->Xp, addionalData->Artifact->ArtifactAppearanceId,
+                addionalData->Artifact->ArtifactTierId, addionalData->Artifact->ArtifactPowers);
+
+        if (addionalData->AzeriteItem)
+            if (AzeriteItem* azeriteItem = item->ToAzeriteItem())
+                azeriteItem->LoadAzeriteItemData(player, *addionalData->AzeriteItem);
+
+        if (addionalData->AzeriteEmpoweredItem)
+            if (AzeriteEmpoweredItem* azeriteEmpoweredItem = item->ToAzeriteEmpoweredItem())
+                azeriteEmpoweredItem->LoadAzeriteEmpoweredItemData(player, *addionalData->AzeriteEmpoweredItem);
+    }
+
+    if (mail)
         mail->AddItem(itemGuid, itemEntry);
 
-        ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemEntry);
-        if (!proto)
-        {
-            TC_LOG_ERROR("entities.player", "Player '%s' (%s) has unknown item_template in mailed items (GUID: " UI64FMTD ", Entry: %u) in mail (%u), deleted.",
-                GetName().c_str(), GetGUID().ToString().c_str(), itemGuid, itemEntry, mail->messageID);
+    if (player)
+        player->AddMItem(item);
 
-            stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_INVALID_MAIL_ITEM);
-            stmt->setUInt64(0, itemGuid);
-            CharacterDatabase.Execute(stmt);
-
-            stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_ITEM_INSTANCE);
-            stmt->setUInt64(0, itemGuid);
-            CharacterDatabase.Execute(stmt);
-            continue;
-        }
-
-        Item* item = NewItemOrBag(proto);
-
-        ObjectGuid ownerGuid = fields[46].GetUInt64() ? ObjectGuid::Create<HighGuid::Player>(fields[46].GetUInt64()) : ObjectGuid::Empty;
-        if (!item->LoadFromDB(itemGuid, ownerGuid, fields, itemEntry))
-        {
-            TC_LOG_ERROR("entities.player", "Player::_LoadMailedItems: Item (GUID: " UI64FMTD ") in mail (%u) doesn't exist, deleted from mail.", itemGuid, mail->messageID);
-
-            stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_MAIL_ITEM);
-            stmt->setUInt64(0, itemGuid);
-            CharacterDatabase.Execute(stmt);
-
-            item->FSetState(ITEM_REMOVED);
-
-            CharacterDatabaseTransaction temp = CharacterDatabaseTransaction(nullptr);
-            item->SaveToDB(temp);                               // it also deletes item object !
-            continue;
-        }
-
-        AddMItem(item);
-    }
-    while (result->NextRow());
+    return item;
 }
 
 void Player::_LoadMailInit(PreparedQueryResult resultUnread, PreparedQueryResult resultDelivery)
@@ -19049,12 +19236,14 @@ void Player::_LoadMail()
     stmt->setUInt64(0, GetGUID().GetCounter());
     PreparedQueryResult result = CharacterDatabase.Query(stmt);
 
+    std::unordered_map<uint32, Mail*> mailById;
+
     if (result)
     {
         do
         {
             Field* fields = result->Fetch();
-            Mail* m = new Mail;
+            Mail* m = new Mail();
 
             m->messageID      = fields[0].GetUInt32();
             m->messageType    = fields[1].GetUInt8();
@@ -19062,14 +19251,13 @@ void Player::_LoadMail()
             m->receiver       = fields[3].GetUInt64();
             m->subject        = fields[4].GetString();
             m->body           = fields[5].GetString();
-            bool has_items    = fields[6].GetBool();
-            m->expire_time    = time_t(fields[7].GetUInt32());
-            m->deliver_time   = time_t(fields[8].GetUInt32());
-            m->money          = fields[9].GetUInt64();
-            m->COD            = fields[10].GetUInt64();
-            m->checked        = fields[11].GetUInt8();
-            m->stationery     = fields[12].GetUInt8();
-            m->mailTemplateId = fields[13].GetInt16();
+            m->expire_time    = time_t(fields[6].GetUInt32());
+            m->deliver_time   = time_t(fields[7].GetUInt32());
+            m->money          = fields[8].GetUInt64();
+            m->COD            = fields[9].GetUInt64();
+            m->checked        = fields[10].GetUInt8();
+            m->stationery     = fields[11].GetUInt8();
+            m->mailTemplateId = fields[12].GetInt16();
 
             if (m->mailTemplateId && !sMailTemplateStore.LookupEntry(m->mailTemplateId))
             {
@@ -19079,13 +19267,51 @@ void Player::_LoadMail()
 
             m->state = MAIL_STATE_UNCHANGED;
 
-            if (has_items)
-                _LoadMailedItems(m);
-
             m_mail.push_back(m);
+            mailById[m->messageID] = m;
         }
         while (result->NextRow());
     }
+
+    stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_MAILITEMS);
+    stmt->setUInt64(0, GetGUID().GetCounter());
+    result = CharacterDatabase.Query(stmt);
+
+    if (result)
+    {
+        stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_MAILITEMS_ARTIFACT);
+        stmt->setUInt64(0, GetGUID().GetCounter());
+        PreparedQueryResult artifactResult = CharacterDatabase.Query(stmt);
+
+        stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_MAILITEMS_AZERITE);
+        stmt->setUInt64(0, GetGUID().GetCounter());
+        PreparedQueryResult azeriteResult = CharacterDatabase.Query(stmt);
+
+        stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_MAILITEMS_AZERITE_MILESTONE_POWER);
+        stmt->setUInt64(0, GetGUID().GetCounter());
+        PreparedQueryResult azeriteItemMilestonePowersResult = CharacterDatabase.Query(stmt);
+
+        stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_MAILITEMS_AZERITE_UNLOCKED_ESSENCE);
+        stmt->setUInt64(0, GetGUID().GetCounter());
+        PreparedQueryResult azeriteItemUnlockedEssencesResult = CharacterDatabase.Query(stmt);
+
+        stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_MAILITEMS_AZERITE_EMPOWERED);
+        stmt->setUInt64(0, GetGUID().GetCounter());
+        PreparedQueryResult azeriteEmpoweredItemResult = CharacterDatabase.Query(stmt);
+
+        std::unordered_map<ObjectGuid::LowType, ItemAdditionalLoadInfo> additionalData;
+        ItemAdditionalLoadInfo::Init(&additionalData, artifactResult, azeriteResult, azeriteItemMilestonePowersResult,
+            azeriteItemUnlockedEssencesResult, azeriteEmpoweredItemResult);
+
+        do
+        {
+            Field* fields = result->Fetch();
+            uint32 mailId = fields[44].GetUInt32();
+            _LoadMailedItem(GetGUID(), this, mailId, mailById[mailId], fields, Trinity::Containers::MapGetValuePtr(additionalData, fields[0].GetUInt64()));
+        }
+        while (result->NextRow());
+    }
+
     m_mailsLoaded = true;
 }
 
@@ -20168,6 +20394,7 @@ void Player::SaveToDB(bool create /*=false*/)
         //save, but in tavern/city
         stmt->setUInt32(index++, GetTalentResetCost());
         stmt->setUInt32(index++, GetTalentResetTime());
+        stmt->setUInt8(index++, GetNumRespecs());
         stmt->setUInt32(index++, GetPrimarySpecialization());
         stmt->setUInt16(index++, (uint16)m_ExtraFlags);
         stmt->setUInt8(index++,  m_stableSlots);
@@ -20430,6 +20657,7 @@ void Player::_SaveAuras(CharacterDatabaseTransaction& trans)
         stmt->setInt32(index++, aura->GetMaxDuration());
         stmt->setInt32(index++, aura->GetDuration());
         stmt->setUInt8(index++, aura->GetCharges());
+        stmt->setUInt32(index++, aura->GetCastItemId());
         stmt->setInt32(index++, aura->GetCastItemLevel());
         trans->Append(stmt);
 
@@ -20464,13 +20692,8 @@ void Player::_SaveInventory(CharacterDatabaseTransaction& trans)
         if (!item || item->GetState() == ITEM_NEW)
             continue;
 
-        stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_CHAR_INVENTORY_BY_ITEM);
-        stmt->setUInt64(0, item->GetGUID().GetCounter());
-        trans->Append(stmt);
-
-        stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_ITEM_INSTANCE);
-        stmt->setUInt64(0, item->GetGUID().GetCounter());
-        trans->Append(stmt);
+        item->DeleteFromInventoryDB(trans);
+        item->DeleteFromDB(trans);
         m_items[i]->FSetState(ITEM_NEW);
     }
 
@@ -20603,7 +20826,7 @@ void Player::_SaveVoidStorage(CharacterDatabaseTransaction& trans)
             stmt->setUInt32(5, _voidStorageItems[i]->RandomBonusListId);
             stmt->setUInt32(6, _voidStorageItems[i]->FixedScalingLevel);
             stmt->setUInt32(7, _voidStorageItems[i]->ArtifactKnowledgeLevel);
-            stmt->setUInt8(8, _voidStorageItems[i]->Context);
+            stmt->setUInt8(8, AsUnderlyingType(_voidStorageItems[i]->Context));
             std::ostringstream bonusListIDs;
             for (int32 bonusListID : _voidStorageItems[i]->BonusListIDs)
                 bonusListIDs << bonusListID << ' ';
@@ -20691,9 +20914,9 @@ void Player::_SaveMail(CharacterDatabaseTransaction& trans)
             {
                 for (MailItemInfoVec::iterator itr2 = m->items.begin(); itr2 != m->items.end(); ++itr2)
                 {
-                    stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_ITEM_INSTANCE);
-                    stmt->setUInt64(0, itr2->item_guid);
-                    trans->Append(stmt);
+                    Item::DeleteFromDB(trans, itr2->item_guid);
+                    AzeriteItem::DeleteFromDB(trans, itr2->item_guid);
+                    AzeriteEmpoweredItem::DeleteFromDB(trans, itr2->item_guid);
                 }
             }
             stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_MAIL_BY_ID);
@@ -22418,8 +22641,8 @@ inline bool Player::_StoreOrEquipNewItem(uint32 vendorslot, uint32 item, uint8 c
     }
 
     Item* it = bStore ?
-        StoreNewItem(vDest, item, true, GenerateItemRandomBonusListId(item), {}, 0, crItem->BonusListIDs, false) :
-        EquipNewItem(uiDest, item, true);
+        StoreNewItem(vDest, item, true, GenerateItemRandomBonusListId(item), {}, ItemContext::Vendor, crItem->BonusListIDs, false) :
+        EquipNewItem(uiDest, item, ItemContext::Vendor, true);
     if (it)
     {
         uint32 new_count = pVendor->UpdateVendorItemCurrentCount(crItem, count);
@@ -25684,10 +25907,10 @@ void Player::InitRunes()
     SetUpdateFieldValue(m_values.ModifyValue(&Unit::m_unitData).ModifyValue(&UF::UnitData::PowerRegenInterruptedFlatModifier, runeIndex), 0.0f);
 }
 
-void Player::AutoStoreLoot(uint8 bag, uint8 slot, uint32 loot_id, LootStore const& store, bool broadcast)
+void Player::AutoStoreLoot(uint8 bag, uint8 slot, uint32 loot_id, LootStore const& store, ItemContext context, bool broadcast)
 {
     Loot loot;
-    loot.FillLoot (loot_id, store, this, true);
+    loot.FillLoot (loot_id, store, this, true, false, LOOT_MODE_DEFAULT, context);
 
     uint32 max_slot = loot.GetMaxSlotInLootFor(this);
     for (uint32 i = 0; i < max_slot; ++i)
@@ -27066,6 +27289,28 @@ void Player::ActivateTalentGroup(ChrSpecializationEntry const* spec)
     activeGlyphs.IsFullUpdate = true;
     SendDirectMessage(activeGlyphs.Write());
 
+    if (Item* item = GetItemByEntry(ITEM_ID_HEART_OF_AZEROTH, ITEM_SEARCH_EVERYWHERE))
+    {
+        if (AzeriteItem* azeriteItem = item->ToAzeriteItem())
+        {
+            if (azeriteItem->IsEquipped())
+            {
+                ApplyAllAzeriteEmpoweredItemMods(false);
+                ApplyAzeritePowers(azeriteItem, false);
+            }
+
+            azeriteItem->SetSelectedAzeriteEssences(spec->ID);
+
+            if (azeriteItem->IsEquipped())
+            {
+                ApplyAzeritePowers(azeriteItem, true);
+                ApplyAllAzeriteEmpoweredItemMods(true);
+            }
+
+            azeriteItem->SetState(ITEM_CHANGED, this);
+        }
+    }
+
     Unit::AuraEffectList const& shapeshiftAuras = GetAuraEffectsByType(SPELL_AURA_MOD_SHAPESHIFT);
     for (AuraEffect* aurEff : shapeshiftAuras)
     {
@@ -27334,13 +27579,13 @@ void Player::RefundItem(Item* item)
     CharacterDatabase.CommitTransaction(trans);
 }
 
-void Player::SendItemRetrievalMail(uint32 itemEntry, uint32 count)
+void Player::SendItemRetrievalMail(uint32 itemEntry, uint32 count, ItemContext context)
 {
     MailSender sender(MAIL_CREATURE, UI64LIT(34337) /* The Postmaster */);
     MailDraft draft("Recovered Item", "We recovered a lost item in the twisting nether and noted that it was yours.$B$BPlease find said object enclosed."); // This is the text used in Cataclysm, it probably wasn't changed.
     CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
 
-    if (Item* item = Item::CreateItem(itemEntry, count, nullptr))
+    if (Item* item = Item::CreateItem(itemEntry, count, context, nullptr))
     {
         item->SaveToDB(trans);
         draft.AddItem(item);

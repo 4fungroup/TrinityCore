@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2008-2019 TrinityCore <https://www.trinitycore.org/>
+ * This file is part of the TrinityCore Project. See AUTHORS file for Copyright information
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the
@@ -44,6 +44,7 @@
 #include "SpellInfo.h"
 #include "SpellMgr.h"
 #include "World.h"
+#include "WorldSession.h"
 
 bool CriteriaData::IsValid(Criteria const* criteria)
 {
@@ -2043,8 +2044,9 @@ bool CriteriaHandler::ModifierSatisfied(ModifierTreeEntry const* modifier, uint6
                 return false;
             break;
         case CRITERIA_ADDITIONAL_CONDITION_REWARDED_QUEST: // 110
-            if (!referencePlayer->GetQuestRewardStatus(reqValue))
-                return false;
+            if (uint32 questBit = sDB2Manager.GetQuestUniqueBitFlag(reqValue))
+                if (!(referencePlayer->m_activePlayerData->QuestCompleted[((questBit - 1) >> 6)] & (UI64LIT(1) << ((questBit - 1) & 63))))
+                    return false;
             break;
         case CRITERIA_ADDITIONAL_CONDITION_COMPLETED_QUEST: // 111
             if (referencePlayer->GetQuestStatus(reqValue) != QUEST_STATUS_COMPLETE)
@@ -2608,8 +2610,8 @@ bool CriteriaHandler::ModifierSatisfied(ModifierTreeEntry const* modifier, uint6
         }
         case CRITERIA_ADDITIONAL_CONDITION_AZERITE_ITEM_LEVEL: // 235
         {
-            Item const* heartOfAzeroth = referencePlayer->GetItemByEntry(ITEM_ID_HEART_OF_AZEROTH);
-            if (!heartOfAzeroth || heartOfAzeroth->ToAzeriteItem()->m_azeriteItemData->Level < reqValue)
+            Item const* heartOfAzeroth = referencePlayer->GetItemByEntry(ITEM_ID_HEART_OF_AZEROTH, ITEM_SEARCH_EVERYWHERE);
+            if (!heartOfAzeroth || heartOfAzeroth->ToAzeriteItem()->GetLevel() < reqValue)
                 return false;
             break;
         }
@@ -2657,7 +2659,7 @@ bool CriteriaHandler::ModifierSatisfied(ModifierTreeEntry const* modifier, uint6
             break;
         case CRITERIA_ADDITIONAL_CONDITION_UNLOCKED_AZERITE_ESSENCE_RANK_LOWER: // 259
         {
-            if (Item const* heartOfAzeroth = referencePlayer->GetItemByEntry(ITEM_ID_HEART_OF_AZEROTH))
+            if (Item const* heartOfAzeroth = referencePlayer->GetItemByEntry(ITEM_ID_HEART_OF_AZEROTH, ITEM_SEARCH_EVERYWHERE))
                 if (AzeriteItem const* azeriteItem = heartOfAzeroth->ToAzeriteItem())
                     for (UF::UnlockedAzeriteEssence const& essence : azeriteItem->m_azeriteItemData->UnlockedEssences)
                         if (essence.AzeriteEssenceID == reqValue && essence.Rank < secondaryAsset)
@@ -2666,7 +2668,7 @@ bool CriteriaHandler::ModifierSatisfied(ModifierTreeEntry const* modifier, uint6
         }
         case CRITERIA_ADDITIONAL_CONDITION_UNLOCKED_AZERITE_ESSENCE_RANK_EQUAL: // 260
         {
-            if (Item const* heartOfAzeroth = referencePlayer->GetItemByEntry(ITEM_ID_HEART_OF_AZEROTH))
+            if (Item const* heartOfAzeroth = referencePlayer->GetItemByEntry(ITEM_ID_HEART_OF_AZEROTH, ITEM_SEARCH_EVERYWHERE))
                 if (AzeriteItem const* azeriteItem = heartOfAzeroth->ToAzeriteItem())
                     for (UF::UnlockedAzeriteEssence const& essence : azeriteItem->m_azeriteItemData->UnlockedEssences)
                         if (essence.AzeriteEssenceID == reqValue && essence.Rank == secondaryAsset)
@@ -2675,7 +2677,7 @@ bool CriteriaHandler::ModifierSatisfied(ModifierTreeEntry const* modifier, uint6
         }
         case CRITERIA_ADDITIONAL_CONDITION_UNLOCKED_AZERITE_ESSENCE_RANK_GREATER: // 261
         {
-            if (Item const* heartOfAzeroth = referencePlayer->GetItemByEntry(ITEM_ID_HEART_OF_AZEROTH))
+            if (Item const* heartOfAzeroth = referencePlayer->GetItemByEntry(ITEM_ID_HEART_OF_AZEROTH, ITEM_SEARCH_EVERYWHERE))
                 if (AzeriteItem const* azeriteItem = heartOfAzeroth->ToAzeriteItem())
                     for (UF::UnlockedAzeriteEssence const& essence : azeriteItem->m_azeriteItemData->UnlockedEssences)
                         if (essence.AzeriteEssenceID == reqValue && essence.Rank > secondaryAsset)
@@ -2698,7 +2700,7 @@ bool CriteriaHandler::ModifierSatisfied(ModifierTreeEntry const* modifier, uint6
                 return false;
             break;
         case CRITERIA_ADDITIONAL_CONDITION_SELECTED_AZERITE_ESSENCE_RANK_LOWER: // 266
-            if (Item const* heartOfAzeroth = referencePlayer->GetItemByEntry(ITEM_ID_HEART_OF_AZEROTH))
+            if (Item const* heartOfAzeroth = referencePlayer->GetItemByEntry(ITEM_ID_HEART_OF_AZEROTH, ITEM_SEARCH_EVERYWHERE))
                 if (AzeriteItem const* azeriteItem = heartOfAzeroth->ToAzeriteItem())
                     if (UF::SelectedAzeriteEssences const* selectedEssences = azeriteItem->GetSelectedAzeriteEssences())
                         for (UF::UnlockedAzeriteEssence const& essence : azeriteItem->m_azeriteItemData->UnlockedEssences)
@@ -2706,7 +2708,7 @@ bool CriteriaHandler::ModifierSatisfied(ModifierTreeEntry const* modifier, uint6
                                 return true;
             return false;
         case CRITERIA_ADDITIONAL_CONDITION_SELECTED_AZERITE_ESSENCE_RANK_GREATER: // 267
-            if (Item const* heartOfAzeroth = referencePlayer->GetItemByEntry(ITEM_ID_HEART_OF_AZEROTH))
+            if (Item const* heartOfAzeroth = referencePlayer->GetItemByEntry(ITEM_ID_HEART_OF_AZEROTH, ITEM_SEARCH_EVERYWHERE))
                 if (AzeriteItem const* azeriteItem = heartOfAzeroth->ToAzeriteItem())
                     if (UF::SelectedAzeriteEssences const* selectedEssences = azeriteItem->GetSelectedAzeriteEssences())
                         for (UF::UnlockedAzeriteEssence const& essence : azeriteItem->m_azeriteItemData->UnlockedEssences)

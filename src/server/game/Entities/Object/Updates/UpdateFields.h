@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2008-2019 TrinityCore <https://www.trinitycore.org/>
+ * This file is part of the TrinityCore Project. See AUTHORS file for Copyright information
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the
@@ -26,6 +26,7 @@
 #include "UpdateMask.h"
 
 class AreaTrigger;
+class AzeriteEmpoweredItem;
 class AzeriteItem;
 class Bag;
 class ByteBuffer;
@@ -130,8 +131,8 @@ struct AzeriteEmpoweredItemData : public IsUpdateFieldStructureTag, public HasCh
 {
     UpdateFieldArray<int32, 5, 0, 1> Selections;
 
-    void WriteCreate(ByteBuffer& data, EnumClassFlag<UpdateFieldFlag> fieldVisibilityFlags, Item const* owner, Player const* receiver) const;
-    void WriteUpdate(ByteBuffer& data, EnumClassFlag<UpdateFieldFlag> fieldVisibilityFlags, Item const* owner, Player const* receiver) const;
+    void WriteCreate(ByteBuffer& data, EnumClassFlag<UpdateFieldFlag> fieldVisibilityFlags, AzeriteEmpoweredItem const* owner, Player const* receiver) const;
+    void WriteUpdate(ByteBuffer& data, EnumClassFlag<UpdateFieldFlag> fieldVisibilityFlags, AzeriteEmpoweredItem const* owner, Player const* receiver) const;
     void ClearChangesMask();
 };
 

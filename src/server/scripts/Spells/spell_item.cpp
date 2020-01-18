@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2008-2019 TrinityCore <https://www.trinitycore.org/>
+ * This file is part of the TrinityCore Project. See AUTHORS file for Copyright information
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the
@@ -22,6 +22,7 @@
  */
 
 #include "ScriptMgr.h"
+#include "AzeritePackets.h"
 #include "Battleground.h"
 #include "CreatureAIImpl.h"
 #include "DB2Stores.h"
@@ -1366,7 +1367,7 @@ class spell_item_mingos_fortune_generator : public SpellScriptLoader
                         return;
                 }
 
-                CreateItem(effIndex, newitemid);
+                CreateItem(effIndex, newitemid, ItemContext::NONE);
             }
 
             void Register() override
@@ -4776,16 +4777,24 @@ class spell_item_heart_of_azeroth : public AuraScript
 
     void SetEquippedFlag(AuraEffect const* /*effect*/, AuraEffectHandleModes /*mode*/)
     {
-        if (Player* target = GetTarget()->ToPlayer())
-            if (Item* item = target->GetItemByGuid(GetAura()->GetCastItemGUID()))
-                item->AddItemFlag2(ITEM_FIELD_FLAG2_HEART_OF_AZEROTH_EQUIPPED);
+        SetState(true);
     }
 
     void ClearEquippedFlag(AuraEffect const* /*effect*/, AuraEffectHandleModes /*mode*/)
     {
+        SetState(false);
+    }
+
+    void SetState(bool equipped)
+    {
         if (Player* target = GetTarget()->ToPlayer())
-            if (Item* item = target->GetItemByGuid(GetAura()->GetCastItemGUID()))
-                item->RemoveItemFlag2(ITEM_FIELD_FLAG2_HEART_OF_AZEROTH_EQUIPPED);
+        {
+            target->ApplyAllAzeriteEmpoweredItemMods(equipped);
+
+            WorldPackets::Azerite::AzeriteEmpoweredItemEquippedStatusChanged statusChanged;
+            statusChanged.IsHeartEquipped = equipped;
+            target->SendDirectMessage(statusChanged.Write());
+        }
     }
 
     void Register()
